@@ -2,151 +2,229 @@ import socket
 import ssl
 
 class URL:
+    """URL 파싱 담당 - URL 문자열을 분석하여 구성 요소로 분리"""
+
     def __init__(self, url: str):
-        
-        # 실습을 위한 프로젝트이므로, 간단한 처리를 위해 모든 스킴은 http라고 전제한다.
         # 스킴이 명시되지 않은 경우 http로 간주한다.
         if "://" in url:
             self.scheme, url = url.split("://", 1)
         else:
             self.scheme = "http"
 
-        assert self.scheme in ["http", "https"]
+        assert self.scheme in ["http", "https", "file"], "지원하지 않는 스킴입니다."
 
         # url에서 호스트와 경로를 분리한다.
         if "/" not in url:
             url = url + '/'
 
-
         self.host, url = url.split("/", 1)
         self.path = "/" + url
-        
-        print(f"-----------------------------------")
-        print(f"📌 Connecting to {self.host}:...")
 
         # 사용자 지정 포트 처리
         if ":" in self.host:
             self.host, port = self.host.split(":", 1)
             self.port = int(port)
+        else:
+            # 기본 포트 설정
+            self.port = 443 if self.scheme == "https" else 80
 
-    def request(self):
+
+class HttpClient:
+    """HTTP 통신 담당 - 소켓 연결, 요청 전송, 응답 수신"""
+
+    USER_AGENT = "DannyTextBrowser/0.1"
+
+    def __init__(self, url: URL):
+        self.url = url
+
+    def _create_socket(self):
+        """소켓 생성 및 SSL 래핑"""
         s = socket.socket(
-            family=socket.AF_INET6,  # IPv6 (localhost가 IPv6로 바인딩된 경우 대응)
+            family=socket.AF_INET6,
             type=socket.SOCK_STREAM,
             proto=socket.IPPROTO_TCP,
         )
 
-        if self.scheme == "https":
+        if self.url.scheme == "https":
             ctx = ssl.create_default_context()
-            s = ctx.wrap_socket(s, server_hostname=self.host)
+            s = ctx.wrap_socket(s, server_hostname=self.url.host)
 
-        # 기본 포트 설정 (포트가 지정되지 않은 경우에만)
-        if not hasattr(self, 'port'):
-            if self.scheme == "https":
-                self.port = 443
-            else:
-                self.port = 80
+        return s
 
-
-        print(f"-----------------------------------")
-        print('📌 Sending request...')
-        print(f"  host: {self.host}")
-        print(f"  path: {self.path}") 
-        print(f"  port: {self.port}")
-
-        s.connect((self.host, self.port))
-
-        # format => f-string의 구버전 문법
-        request = "GET {} HTTP/1.1\r\n".format(self.path)
-        request += "Host: {}\r\n".format(self.host)
-        request += "User-Agent: DannyTextBrowser/0.1\r\n"
-        request += "Connection: close\r\n"  # 응답 완료 후 연결 종료
+    def _build_request(self) -> str:
+        """HTTP 요청 문자열 생성"""
+        request = f"GET {self.url.path} HTTP/1.1\r\n"
+        request += f"Host: {self.url.host}\r\n"
+        request += f"User-Agent: {self.USER_AGENT}\r\n"
+        request += "Connection: close\r\n"
         request += "\r\n"
-        s.send(request.encode("utf-8"))
+        return request
 
-        # 소켓을 파일 객체로 감싼다.
-        response = s.makefile("r", encoding="utf-8", newline="\r\n")
-
-        # HTTP 응답의 첫 번째 줄(상태 라인)을 읽어들인다.
+    def _parse_status_line(self, response) -> tuple[str, str, str]:
+        """상태 라인 파싱"""
         status_line = response.readline()
         version, status, explanation = status_line.split(" ", 2)
+        return version, status, explanation.strip()
 
+    def _parse_headers(self, response) -> dict:
+        """헤더 파싱"""
+        headers = {}
+        while True:
+            line = response.readline()
+            if line == "\r\n":
+                break
+            header, value = line.split(":", 1)
+            headers[header.casefold()] = value.strip()
+        return headers
+
+    def _read_body(self, response, headers: dict) -> str:
+        """응답 본문 읽기 - 인코딩 방식에 따라 처리"""
+        # 청크 인코딩된 응답 처리
+        if "transfer-encoding" in headers:
+            return self._read_chunked_body(response)
+        # Content-Length가 명시된 응답 처리
+        elif "content-length" in headers:
+            length = int(headers["content-length"])
+            return response.read(length)
+        # 그 외 (Connection: close에 의존)
+        else:
+            return response.read()
+
+    def _read_chunked_body(self, response) -> str:
+        """청크 인코딩된 응답 본문 읽기"""
+        body = ""
+        while True:
+            size_line = response.readline().strip()
+            size = int(size_line, 16)
+
+            if size == 0:
+                break
+
+            chunk = response.read(size)
+            body += chunk
+            response.readline()  # 청크 뒤의 \r\n 소비
+
+        return body
+
+    def fetch(self) -> str:
+        """HTTP 요청을 수행하고 응답 본문을 반환"""
+        print(f"-----------------------------------")
+        print(f"📌 Connecting to {self.url.host}:...")
+
+        s = self._create_socket()
+        s.connect((self.url.host, self.url.port))
+
+        # 요청 전송
+        print(f"-----------------------------------")
+        print('📌 Sending request...')
+        print(f"  scheme: {self.url.scheme}")
+        print(f"  host: {self.url.host}")
+        print(f"  path: {self.url.path}")
+        print(f"  port: {self.url.port}")
+
+        request = self._build_request()
+        s.send(request.encode("utf-8"))
+
+        # 응답 수신
+        response = s.makefile("r", encoding="utf-8", newline="\r\n")
+
+        version, status, explanation = self._parse_status_line(response)
         print('-----------------------------------')
         print('📌 Response status line:')
         print(f"  Version: {version}")
         print(f"  Status: {status}")
-        print(f"  Explanation: {explanation.strip()}")
+        print(f"  Explanation: {explanation}")
 
-        # status_line 이후의 헤더들을 모두 읽어들인다.
-        # response.readline()을 반복 호출하여 헤더의 끝을 나타내는 빈 줄("\r\n")이 나올 때까지 읽는다.
-        # response.readline()은 호출할때마다 다음 라인으로 이동하므로, 본 반복문을 도는 시점에 상태 코드는 읽지 않는다.
-        response_headers = {}
-        while True:
-            line = response.readline()
-            if line == "\r\n": break
-            header, value = line.split(":", 1)
-            response_headers[header.casefold()] = value.strip()
-
+        headers = self._parse_headers(response)
         print('-----------------------------------')
         print('📌 Response headers:')
-        for header, value in response_headers.items():
+        for header, value in headers.items():
             print(f"  {header}: {value}")
 
-        # 실습 프로젝트이므로 압축 인코딩을 사용하지 않는 응답만 처리한다.
-        assert "content-encoding" not in response_headers
+        # 실습 프로젝트이므로 압축 인코딩을 사용하지 않는 응답만 처리
+        assert "content-encoding" not in headers
 
-        # 헤더 이후의 응답 본문을 읽어들인다.
-        # 청크 인코딩된 응답과 아닌 응답을 구분하여 처리한다.
-        if "transfer-encoding" in response_headers:
-            # 청크 인코딩된 응답 처리
-            body = ""
-            while True:
-                # 청크 크기 읽기 (16진수 문자열)
-                size_line = response.readline().strip()
-                size = int(size_line, 16)
+        body = self._read_body(response, headers)
 
-                if size == 0:
-                    break
-
-                # 해당 크기만큼 데이터 읽기
-                chunk = response.read(size)
-                body += chunk
-
-                response.readline()  # 청크 뒤의 \r\n 소비
-
-        # Content-Length가 명시된 응답 처리
-        elif "content-length" in response_headers:
-            length = int(response_headers["content-length"])
-            body = response.read(length)
-        
-        else:
-            body = response.read()
-
-        # 소켓과 파일 객체 닫기
         s.close()
-
         return body
 
-## 간단한 HTML 태그 제거기 (학습용)
-def show(body):
-    in_tag = False
-    for c in body:
-        if c == "<":
-            in_tag = True
-        elif c == ">":
-            in_tag = False
-        elif not in_tag:
-            print(c, end="")
 
-def load(url):
-    body = url.request()
-    print('-----------------------------------')
-    print("📌 Response body:")
-    show(body)
+class HtmlRenderer:
+    """HTML 렌더링 담당 - HTML 태그를 제거하고 텍스트만 출력"""
+
+    @staticmethod
+    def strip_tags(html: str) -> str:
+        """HTML 태그를 제거하고 텍스트만 반환"""
+        result = ""
+        in_tag = False
+        for c in html:
+            if c == "<":
+                in_tag = True
+            elif c == ">":
+                in_tag = False
+            elif not in_tag:
+                result += c
+        return result
+
+    @staticmethod
+    def render(html: str):
+        """HTML을 렌더링하여 출력"""
+        print('-----------------------------------')
+        print("📌 Response body:")
+        text = HtmlRenderer.strip_tags(html)
+        print(text)
+
+class FileRenderer: 
+    """파일 렌더링 담당 - 파일 내용을 출력"""
+
+    @staticmethod
+    def render(url_path: str):
+        import mimetypes
+
+        mime_guess_type = mimetypes.guess_type(url_path)[0]
+
+        is_image = mime_guess_type.startswith("image/")
+        is_text = mime_guess_type.startswith("text/")
+
+        if is_image:
+            # 바이너리로 읽기
+            with open(url_path, "rb") as f:
+                body = f.read()
+            print(f"-----------------------------------")
+            print(f"✅ 이미지 파일 읽기 성공")
+            print(f"-----------------------------------")
+            print(f"    파일 크기: {len(body)} bytes")
+            return
+
+        if is_text:
+            with open(url_path, "r", encoding="utf-8") as f:
+                body = f.read()
+            print(f"-----------------------------------")
+            print(f"✅ 텍스트 파일 읽기 성공")
+            print(f"-----------------------------------")
+            print(f"")
+            print(f"{body}")
+            print(f"")
+            return
+        
+
+class Browser:
+    """브라우저 - URL을 받아 페이지를 로드하고 렌더링"""
+
+    def load(self, url_string: str):
+        url = URL(url_string)
+        
+        if url.scheme == "file":
+            FileRenderer.render(url.path)
+            return
+        
+        client = HttpClient(url)
+        body = client.fetch()
+        HtmlRenderer.render(body)
+
 
 if __name__ == "__main__":
     import sys
-    load(URL(sys.argv[1]))
-
-
-
+    browser = Browser()
+    browser.load(sys.argv[1])
