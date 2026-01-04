@@ -67,6 +67,9 @@ class HttpClient:
 
     USER_AGENT = "DannyTestBrowser/0.1"
 
+    socket: socket.socket | None = None
+    response = None
+
     def __init__(self, url: URL):
         self.url = url
 
@@ -89,13 +92,13 @@ class HttpClient:
         request = f"GET {self.url.path} HTTP/1.1\r\n"
         request += f"Host: {self.url.host}\r\n"
         request += f"User-Agent: {self.USER_AGENT}\r\n"
-        request += "Connection: close\r\n"
+        request += "Connection: keep-alive\r\n"
         request += "\r\n"
         return request
 
     def _parse_status_line(self, response) -> tuple[str, str, str]:
         """상태 라인 파싱"""
-        status_line = response.readline()
+        status_line = response.readline().decode("utf-8").strip()
         version, status, explanation = status_line.split(" ", 2)
         return version, status, explanation.strip()
 
@@ -103,7 +106,7 @@ class HttpClient:
         """헤더 파싱"""
         headers = {}
         while True:
-            line = response.readline()
+            line = response.readline().decode("utf-8")
             if line == "\r\n":
                 break
             header, value = line.split(":", 1)
@@ -112,28 +115,30 @@ class HttpClient:
 
     def _read_body(self, response, headers: dict) -> str:
         """응답 본문 읽기 - 인코딩 방식에 따라 처리"""
+
         # 청크 인코딩된 응답 처리
         if "transfer-encoding" in headers:
             return self._read_chunked_body(response)
         # Content-Length가 명시된 응답 처리
         elif "content-length" in headers:
+            print('content-length found')
             length = int(headers["content-length"])
-            return response.read(length)
-        # 그 외 (Connection: close에 의존)
+            return response.read(length).decode("utf-8", errors="replace")
+        # 그 외의 경우 예외 처리
         else:
-            return response.read()
+            raise ValueError("keep-alive 연결에서는 content-length 또는 transfer-encoding이 필요합니다.")
 
     def _read_chunked_body(self, response) -> str:
         """청크 인코딩된 응답 본문 읽기"""
         body = ""
         while True:
-            size_line = response.readline().strip()
+            size_line = response.readline().decode("utf-8").strip()
             size = int(size_line, 16)
 
             if size == 0:
                 break
 
-            chunk = response.read(size)
+            chunk = response.read(size).decode("utf-8", errors="replace")
             body += chunk
             response.readline()  # 청크 뒤의 \r\n 소비
 
@@ -141,12 +146,17 @@ class HttpClient:
 
     def fetch(self) -> str:
         """HTTP 요청을 수행하고 응답 본문을 반환"""
-        print(f"-----------------------------------")
-        print(f"📌 Connecting to {self.url.host}:...")
-
-        s = self._create_socket()
-        s.connect((self.url.host, self.url.port))
-
+        # 소켓이 없으면 새로 생성하고 연결
+        if self.socket is None:
+            print(f"-----------------------------------")
+            print(f"📌 Connecting to {self.url.host}:...")
+            self.socket = self._create_socket()
+            self.socket.connect((self.url.host, self.url.port))
+            self.socket.settimeout(5)  # 타임아웃 설정
+            self.response = self.socket.makefile("rb") # 소켓을 파일 객체로 래핑
+            
+            print(f"✅ response :{self.response}")
+            
         # 요청 전송
         print(f"-----------------------------------")
         print('📌 Sending request...')
@@ -156,19 +166,16 @@ class HttpClient:
         print(f"  port: {self.url.port}")
 
         request = self._build_request()
-        s.send(request.encode("utf-8"))
+        self.socket.send(request.encode("utf-8"))
 
-        # 응답 수신
-        response = s.makefile("r", encoding="utf-8", newline="\r\n")
-
-        version, status, explanation = self._parse_status_line(response)
+        version, status, explanation = self._parse_status_line(self.response)
         print('-----------------------------------')
         print('📌 Response status line:')
         print(f"  Version: {version}")
         print(f"  Status: {status}")
         print(f"  Explanation: {explanation}")
 
-        headers = self._parse_headers(response)
+        headers = self._parse_headers(self.response)
         print('-----------------------------------')
         print('📌 Response headers:')
         for header, value in headers.items():
@@ -177,10 +184,17 @@ class HttpClient:
         # 실습 프로젝트이므로 압축 인코딩을 사용하지 않는 응답만 처리
         assert "content-encoding" not in headers
 
-        body = self._read_body(response, headers)
+        body = self._read_body(self.response, headers)
 
-        s.close()
+        # 소켓을 닫지 않고 유지 (keep-alive)
         return body
+
+    def close(self):
+        """소켓 연결 종료"""
+        if self.socket:
+            self.socket.close()
+            self.socket = None
+            self.response = None
 
 
 class HtmlRenderer:
@@ -260,9 +274,21 @@ class FileRenderer:
 class Browser:
     """브라우저 - URL을 받아 페이지를 로드하고 렌더링"""
 
+    clients: dict[str, HttpClient] = {}  # host:port별로 클라이언트 캐싱
+
+    def _get_client(self, url: URL) -> HttpClient:
+        """동일 호스트면 기존 클라이언트 재사용, 아니면 새로 생성"""
+        key = f"{url.host}:{url.port}"
+        if key not in self.clients:
+            self.clients[key] = HttpClient(url)
+        else:
+            # 기존 클라이언트의 URL(path) 업데이트
+            self.clients[key].url = url
+        return self.clients[key]
+
     def load(self, url_string: str):
         url = URL(url_string)
-        
+
         if url.scheme == "data":
             print(f"-----------------------------------")
             print(f"✅ data scheme 처리")
@@ -274,7 +300,7 @@ class Browser:
             FileRenderer.render(url.path)
             return
         
-        client = HttpClient(url)
+        client = self._get_client(url)
         body = client.fetch()
 
         if url.is_view_source:
@@ -284,10 +310,13 @@ class Browser:
 
 
 if __name__ == "__main__":
-    import sys
-    from urllib.parse import unquote
+    # import sys
+    # from urllib.parse import unquote
 
     # 입력된 URL 디코딩 처리
-    decoded_url = unquote(sys.argv[1])
+    # decoded_url = unquote(sys.argv[1])
     browser = Browser()
-    browser.load(decoded_url)
+
+    # browser.load(decoded_url)
+    browser.load('https://browser.engineering/examples/example1-simple.html')
+    browser.load('https://browser.engineering/index.html')
