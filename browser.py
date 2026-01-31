@@ -1,6 +1,8 @@
 import socket
 import ssl
 
+from cache import Cache, MemoryCache
+
 SUPPORTED_SCHEMES = frozenset(["http", "https", "file", "data"])
 
 class URL:
@@ -143,8 +145,8 @@ class HttpClient:
 
         return body
 
-    def fetch(self) -> str:
-        """HTTP 요청을 수행하고 응답 본문을 반환"""
+    def fetch(self) -> tuple[dict, str]:
+        """HTTP 요청을 수행하고 (헤더, 본문) 튜플을 반환"""
         # 소켓이 없으면 새로 생성하고 연결
         if self.socket is None:
             print(f"-----------------------------------")
@@ -198,7 +200,7 @@ class HttpClient:
         body = self._read_body(self.response, headers)
 
         # 소켓을 닫지 않고 유지 (keep-alive)
-        return body
+        return headers, body
 
     def close(self):
         """소켓 연결 종료"""
@@ -288,6 +290,9 @@ class Browser:
 
     clients: dict[str, HttpClient] = {}  # host:port별로 클라이언트 캐싱
 
+    def __init__(self, cache: Cache | None = None):
+        self.cache = cache or MemoryCache()
+
     def _get_client(self, url: URL) -> HttpClient:
         """동일 호스트면 기존 클라이언트 재사용, 아니면 새로 생성"""
         key = f"{url.host}:{url.port}"
@@ -312,8 +317,29 @@ class Browser:
             FileRenderer.render(url.path)
             return
         
-        client = self._get_client(url)
-        body = client.fetch()
+        cache_key = url_string
+
+        cached_body = self.cache.get(cache_key)
+
+        if cached_body is not None:
+            print(f"📦 Cache hit: {cache_key}")
+            body = cached_body
+        else:
+            print(f"🌐 Cache miss: {cache_key}")
+            client = self._get_client(url)
+            headers, body = client.fetch()
+
+            # cache-control 헤더 파싱
+            # - no-store가 없고 max-age가 있으면 캐시에 저장
+            cache_control = headers.get("cache-control", "")
+            if "no-store" not in cache_control:
+                max_age = 0
+                for directive in cache_control.split(","):
+                    directive = directive.strip()
+                    if directive.startswith("max-age="):
+                        max_age = int(directive[len("max-age="):])
+                if max_age > 0:
+                    self.cache.set(cache_key, body, max_age)
 
         if url.is_view_source:
             ViewSourceRenderer.render(body)
@@ -340,8 +366,25 @@ if __name__ == "__main__":
     # 2. 동일 호스트 테스트
     # browser.load('https://browser.engineering/examples/example1-simple.html')
     # browser.load('https://browser.engineering/index.html')
-    
+
     # 3. redirect 테스트
     # browser.load('https://browser.engineering/redirect')
     # browser.load('https://browser.engineering/redirect2')
-    browser.load('http://browser.engineering/redirect3')
+    # browser.load('http://browser.engineering/redirect3')
+
+    # 4. 캐시 테스트
+    # 4-1. cache-control: max-age가 있는 URL → 두 번째 요청에서 Cache hit
+    browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
+    browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
+
+    # 4-2. cache-control 헤더 없는 URL → 매번 Cache miss
+    browser.load('https://browser.engineering/http.html')
+    browser.load('https://browser.engineering/http.html')
+
+    # 4-3. cache-control: max-age=0 → 매번 Cache miss
+    browser.load('https://www.google.com/')
+    browser.load('https://www.google.com/')
+
+    # 4-4. cache-control: no-store → 캐시 저장 안 함, 매번 Cache miss
+    browser.load('https://github.com/login')
+    browser.load('https://github.com/login')
