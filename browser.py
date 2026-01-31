@@ -1,3 +1,4 @@
+import gzip
 import socket
 import ssl
 
@@ -94,6 +95,7 @@ class HttpClient:
         request = f"GET {self.url.path} HTTP/1.1\r\n"
         request += f"Host: {self.url.host}\r\n"
         request += f"User-Agent: {self.USER_AGENT}\r\n"
+        request += "Accept-Encoding: gzip\r\n"
         request += "Connection: keep-alive\r\n"
         request += "\r\n"
         return request
@@ -115,8 +117,8 @@ class HttpClient:
             headers[header.casefold()] = value.strip()
         return headers
 
-    def _read_body(self, response, headers: dict) -> str:
-        """응답 본문 읽기 - 인코딩 방식에 따라 처리"""
+    def _read_body(self, response, headers: dict) -> bytes:
+        """응답 본문 읽기 - 인코딩 방식에 따라 raw bytes 반환"""
 
         # 청크 인코딩된 응답 처리
         if "transfer-encoding" in headers:
@@ -124,14 +126,14 @@ class HttpClient:
         # Content-Length가 명시된 응답 처리
         elif "content-length" in headers:
             length = int(headers["content-length"])
-            return response.read(length).decode("utf-8", errors="replace")
+            return response.read(length)
         # 그 외의 경우 예외 처리
         else:
             raise ValueError("keep-alive 연결에서는 content-length 또는 transfer-encoding이 필요합니다.")
 
-    def _read_chunked_body(self, response) -> str:
+    def _read_chunked_body(self, response) -> bytes:
         """청크 인코딩된 응답 본문 읽기"""
-        body = ""
+        body = b""
         while True:
             size_line = response.readline().decode("utf-8").strip()
             size = int(size_line, 16)
@@ -139,7 +141,7 @@ class HttpClient:
             if size == 0:
                 break
 
-            chunk = response.read(size).decode("utf-8", errors="replace")
+            chunk = response.read(size)
             body += chunk
             response.readline()  # 청크 뒤의 \r\n 소비
 
@@ -181,9 +183,6 @@ class HttpClient:
         for header, value in headers.items():
             print(f"  {header}: {value}")
 
-        # 실습 프로젝트이므로 압축 인코딩을 사용하지 않는 응답만 처리
-        assert "content-encoding" not in headers
-
         # status code가 301, 302인 경우 redirect 처리
         if status in ("301", "302"):
             redirect_url = headers.get("location")
@@ -197,7 +196,13 @@ class HttpClient:
             self.url = URL(redirect_url)
             return self.fetch()  # 재귀 호출로 리다이렉트 처리
 
-        body = self._read_body(self.response, headers)
+        raw_body = self._read_body(self.response, headers)
+
+        # gzip 압축 해제
+        if headers.get("content-encoding") == "gzip":
+            raw_body = gzip.decompress(raw_body)
+
+        body = raw_body.decode("utf-8", errors="replace")
 
         # 소켓을 닫지 않고 유지 (keep-alive)
         return headers, body
@@ -236,7 +241,8 @@ class HtmlRenderer:
         print("📌 Response body:")
         text = HtmlRenderer.strip_tags(html_string)
         unescaped_text = html.unescape(text)
-        # print(unescaped_text)
+        print(unescaped_text)
+        print('-----------------------------------')
         print(' successfully rendered html content ')
 
 class ViewSourceRenderer:
@@ -374,17 +380,20 @@ if __name__ == "__main__":
 
     # 4. 캐시 테스트
     # 4-1. cache-control: max-age가 있는 URL → 두 번째 요청에서 Cache hit
-    browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
-    browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
+    # browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
+    # browser.load('https://cdn.jsdelivr.net/npm/jquery@3.7.1/dist/jquery.min.js')
 
     # 4-2. cache-control 헤더 없는 URL → 매번 Cache miss
-    browser.load('https://browser.engineering/http.html')
-    browser.load('https://browser.engineering/http.html')
+    # browser.load('https://browser.engineering/http.html')
+    # browser.load('https://browser.engineering/http.html')
 
     # 4-3. cache-control: max-age=0 → 매번 Cache miss
-    browser.load('https://www.google.com/')
-    browser.load('https://www.google.com/')
+    # browser.load('https://www.google.com/')
+    # browser.load('https://www.google.com/')
 
     # 4-4. cache-control: no-store → 캐시 저장 안 함, 매번 Cache miss
-    browser.load('https://github.com/login')
-    browser.load('https://github.com/login')
+    # browser.load('https://github.com/login')
+    # browser.load('https://github.com/login')
+
+    # 5. gzip 압축 해제 테스트
+    browser.load('https://browser.engineering/http.html')
